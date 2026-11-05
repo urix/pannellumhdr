@@ -12,3 +12,7 @@ utils/doc/generated_docs
 
 # Ignore logs
 tests/*.log
+
+# Ignore locally installed browser test dependencies
+node_modules/
+npm-debug.log*

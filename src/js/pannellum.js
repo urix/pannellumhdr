@@ -55,6 +55,7 @@ var config,
     isTimedOut = false,
     listenersAdded = false,
     panoImage,
+    panoImageBlob,
     prevTime,
     speed = {'yaw': 0, 'pitch': 0, 'hfov': 0},
     animating = false,
@@ -104,6 +105,7 @@ var defaultConfig = {
     showZoomCtrl: true,
     autoLoad: false,
     showControls: true,
+    dynamicRange: 'auto',
     orientationOnByDefault: false,
     hotSpotDebug: false,
     backgroundColor: [0, 0, 0],
@@ -309,6 +311,7 @@ processOptions(true);
  * @private
  */
 function init() {
+    panoImageBlob = undefined;
     // Display an error for IE 9 as it doesn't work but also doesn't otherwise
     // show an error (older versions don't work at all)
     // Based on: http://stackoverflow.com/a/10965203
@@ -639,35 +642,54 @@ function parseGPanoXMP(image, url) {
         }
         
         // Load panorama
-        panoImage.src = window.URL.createObjectURL(image);
-        panoImage.onerror = function() {
-            // If the image fails to load, we check the Content Security Policy
-            // headers and see if they block loading images as blobs. If they
-            // do, we load the image directly from the URL. While this should
-            // allow the image to load, it does prevent parsing of XMP data.
-            function getCspHeaders() {
-                if (!window.fetch)
-                    return null;
-                return window.fetch(document.location.href)
-                    .then(function(resp){
-                        return resp.headers.get('Content-Security-Policy');
-                    });
-            }
-            getCspHeaders().then(function(cspHeaders) {
-                if (cspHeaders) {
-                    var invalidImgSource = cspHeaders.split(";").find(function(p) {
-                        var matchstring = p.match(/img-src(.*)/);
-                        if (matchstring) {
-                            return !matchstring[1].includes("blob");
-                        }
-                    });
-                    if (invalidImgSource) {
-                        console.log('CSP blocks blobs; reverting to URL.');
-                        panoImage.crossOrigin = config.crossOrigin;
-                        panoImage.src = url;
-                    }
+        panoImageBlob = image;
+        var nativeImage = panoImage;
+        function loadNativeImage() {
+            panoImage.src = window.URL.createObjectURL(image);
+            panoImage.onerror = function() {
+                // If the image fails to load, we check the Content Security Policy
+                // headers and see if they block loading images as blobs. If they
+                // do, we load the image directly from the URL. While this should
+                // allow the image to load, it does prevent parsing of XMP data.
+                function getCspHeaders() {
+                    if (!window.fetch)
+                        return null;
+                    return window.fetch(document.location.href)
+                        .then(function(resp){
+                            return resp.headers.get('Content-Security-Policy');
+                        });
                 }
+                getCspHeaders().then(function(cspHeaders) {
+                    if (cspHeaders) {
+                        var invalidImgSource = cspHeaders.split(";").find(function(p) {
+                            var matchstring = p.match(/img-src(.*)/);
+                            if (matchstring) {
+                                return !matchstring[1].includes("blob");
+                            }
+                        });
+                        if (invalidImgSource) {
+                            console.log('CSP blocks blobs; reverting to URL.');
+                            panoImage.crossOrigin = config.crossOrigin;
+                            panoImage.src = url;
+                        }
+                    }
+                });
+            }
+        }
+        if (window.libpannellum.prepareHDRImage) {
+            window.libpannellum.prepareHDRImage(image).then(function(descriptor) {
+                if (panoImage !== nativeImage) return; // A different scene replaced this load.
+                if (descriptor) {
+                    panoImage = descriptor;
+                    onImageLoad();
+                } else {
+                    loadNativeImage();
+                }
+            }).catch(function() {
+                if (panoImage === nativeImage) loadNativeImage();
             });
+        } else {
+            loadNativeImage();
         }
     });
     if (reader.readAsBinaryString !== undefined)
@@ -1783,24 +1805,35 @@ function renderInit() {
             params.horizonRoll = config.horizonRoll * Math.PI / 180;
         if (config.backgroundColor !== undefined)
             params.backgroundColor = config.backgroundColor;
+        params.dynamicRange = config.dynamicRange;
+        params.sourceBlob = panoImageBlob;
+        params.errorCallback = handleRendererError;
         renderer.init(panoImage, config.type, config.haov * Math.PI / 180, config.vaov * Math.PI / 180, config.vOffset * Math.PI / 180, renderInitCallback, params);
     } catch(event) {
-        // Panorama not loaded
+        handleRendererError(event);
+    }
+}
 
-        if (config.dynamic !== true) {
-            // Allow image to be garbage collected
-            panoImage = undefined;
-        }
+/**
+ * Handles synchronous WebGL and asynchronous WebGPU initialization errors.
+ * @private
+ */
+function handleRendererError(event) {
+    // Panorama not loaded
+    if (config.dynamic !== true) {
+        // Allow image to be garbage collected
+        panoImage = undefined;
+        panoImageBlob = undefined;
+    }
 
-        // Display error if there is a bad texture
-        if (event.type == 'webgl error' || event.type == 'no webgl') {
-            anError();
-        } else if (event.type == 'webgl size error') {
-            anError(config.strings.textureSizeError.replace('%s', event.width).replace('%s', event.maxWidth));
-        } else {
-            anError(config.strings.unknownError);
-            throw event;
-        }
+    // Display error if there is a bad texture
+    if (event.type == 'webgl error' || event.type == 'no webgl') {
+        anError();
+    } else if (event.type == 'webgl size error') {
+        anError(config.strings.textureSizeError.replace('%s', event.width).replace('%s', event.maxWidth));
+    } else {
+        anError(config.strings.unknownError);
+        throw event;
     }
 }
 
@@ -1844,6 +1877,7 @@ function renderInitCallback() {
     if (config.dynamic !== true) {
         // Allow image to be garbage collected
         panoImage = undefined;
+        panoImageBlob = undefined;
     }
     
     animateInit();

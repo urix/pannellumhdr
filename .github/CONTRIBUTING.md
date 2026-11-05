@@ -1,3 +1,23 @@
-# Contributing
+# Contributing to Pannellum HDR
 
-Development takes place at [github.com/mpetroff/pannellum](https://github.com/mpetroff/pannellum). Issues should be opened to report bugs or suggest improvements (or ask questions), and pull requests are welcome. Please make an attempt to write in grammatically-correct English on the issue tracker; using the results of machine translation is acceptable if one in not fluent in the language, and attempts to work past language barriers will be made. When reporting a bug, please try to include a minimum reproducible example (or at least some sort of example). When proposing changes, please try to match the existing code style, e.g., four space indentation and [JSHint](https://jshint.com/) validation. If your pull request adds an additional configuration parameter, please document it in `doc/json-config-parameters.md`. Pull requests should preferably be created from [feature branches](https://www.atlassian.com/git/tutorials/comparing-workflows/feature-branch-workflow).
+This fork is maintained at [urix/pannellumhdr](https://github.com/urix/pannellumhdr).
+Open issues and pull requests here for HDR additions and other fork changes.
+The original [Pannellum project](https://github.com/mpetroff/pannellum) has its
+own contribution and communication policies for work submitted upstream.
+
+For bug reports, include a minimal reproducible example, browser and operating
+system versions, and relevant console errors. For HDR issues, include the
+`dynamicRange` setting, GPU / display details, and output from the loaded
+viewer's `getRenderer().getHDRInfo()` and `getRenderer().getHDRDiagnostics()`.
+Distinguish rendering errors from physical HDR display presentation.
+
+Keep patches focused and follow the surrounding code style, including four
+space indentation in viewer source. Document new configuration parameters in
+`doc/json-config-parameters.md` and, when applicable, `doc/url-config-parameters.md`.
+Preserve upstream copyright notices and bundled third-party license notices.
+
+Run `npm run test:hdr` for HDR changes. Build the viewer and run relevant browser
+checks as described in the root [README](../readme.md#tests). Include the commands
+and results in the pull request, and state which browser / device checks remain
+unverified. Generated `build/` files are ignored by Git; commit the source and
+required worker, decoder, license, example, and test files instead.

@@ -1,9 +1,9 @@
 {
-  "name": "pannellum",
-  "description": "Pannellum is a lightweight, free, and open source panorama viewer for the web.",
+  "name": "pannellumhdr",
+  "description": "Pannellum HDR: a panorama viewer with WebGPU HDR, streaming PQ AVIF decoding, SDR tone mapping, and WebGL fallback.",
   "version": "2.5.6",
   "bugs": {
-    "url": "https://github.com/mpetroff/pannellum/issues"
+    "url": "https://github.com/urix/pannellumhdr/issues"
   },
   "author": {
     "name": "Matthew Petroff",
@@ -11,13 +11,25 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/mpetroff/pannellum.git"
+    "url": "https://github.com/urix/pannellumhdr.git"
   },
   "license": "MIT",
-  "homepage": "https://pannellum.org/",
+  "homepage": "https://github.com/urix/pannellumhdr#readme",
   "main": "build/pannellum.js",
   "keywords": [
     "panorama",
-    "viewer"
-  ]
+    "viewer",
+    "hdr",
+    "webgpu",
+    "avif"
+  ],
+  "contributors": [
+    {
+      "name": "Yury Golubinsky"
+    }
+  ],
+  "scripts": {
+    "test:hdr": "node tests/hdr-icc.test.mjs && node tests/hdr-stream.test.mjs && node tests/hdr-upload.test.cjs",
+    "test:hdr:browser": "node tests/hdr-browser.test.cjs"
+  }
 }

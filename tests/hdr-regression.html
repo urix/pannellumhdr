@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>HDR regression checks</title>
+<style>body{background:#202020;color:white;font:16px system-ui}#view{width:256px;height:128px}pre{white-space:pre-wrap}</style>
+<h1>HDR regression checks</h1>
+<pre id="results">Running…</pre><div id="view"></div>
+<script src="../src/js/libpannellum.js"></script>
+<script type="module">
+import {pqToLinear, float16, avifColor, linearP3Tiles} from '../src/js/hdr/color.mjs';
+const results = document.getElementById('results'), lines = [];
+function check(ok, name) {if (!ok) throw Error(name); lines.push('PASS: '+name); results.textContent=lines.join('\n');}
+function halfToFloat(h) {
+    const sign=h&0x8000?-1:1, e=(h>>10)&31, m=h&1023;
+    return sign*(e===0 ? m*Math.pow(2,-24) : e===31 ? (m?NaN:Infinity) : (1+m/1024)*Math.pow(2,e-15));
+}
+let renderer;
+const outputColorSpace = 'display-p3';
+try {
+    check(pqToLinear(0)===0,'PQ black stays black');
+    check(Math.abs(pqToLinear(0.580688881)-1)<1e-6,'203-nit reference white = 1');
+    check(Math.abs(pqToLinear(0.751827096)-1000/203)<1e-6,'1000-nit highlight exceeds SDR white');
+    for (const n of [0, -0.02, 0.00001, 0.18, 1, 4.926, 49.26])
+        check(Math.abs(halfToFloat(float16(n))-n)<Math.max(1e-7,Math.abs(n)*0.001),'float16 round-trip '+n);
+    const raw=new Uint16Array([0,0,0,1023,594,594,594,1023,769,769,769,1023]);
+    const fixture={width:3,height:1,depth:10,data:new Uint8Array(raw.buffer)};
+    const whole=linearP3Tiles(fixture,[3]), split=linearP3Tiles(fixture,[2,1]);
+    check([...whole.tiles[0].data].join() === [...split.tiles[0].data,...split.tiles[1].data].join(),'split and single textures preserve identical HDR pixels');
+    check(whole.peak>4,'HDR conversion preserves highlights');
+    const blob=await (await fetch('../examples/test-hdr.avif')).blob();
+    const profile=avifColor(await blob.arrayBuffer());
+    check(profile.primaries===9&&profile.transfer===16,'AVIF primary image is Rec.2020 PQ');
+    let rejected=false;
+    try {avifColor((await blob.arrayBuffer()).slice(0,20));} catch {rejected=true;}
+    check(rejected,'truncated AVIF rejected');
+    const image=new Image(), url=URL.createObjectURL(blob);
+    image.src=url; await image.decode(); URL.revokeObjectURL(url);
+    renderer=libpannellum.renderer(document.getElementById('view'));
+    await new Promise((resolve,reject)=>renderer.init(image,'equirectangular',Math.PI*2,Math.PI,0,resolve,{dynamicRange:'high',sourceBlob:blob,errorCallback:reject}));
+    check(renderer.getDynamicRange()==='high','HDR renderer active');
+    const info=renderer.getHDRInfo();
+    check(info?.decoder==='libavif-wasm'&&info.depth===10&&info.peakLinear>1,'real AVIF decoded at 10 bits with HDR highlights');
+    const context=renderer.getCanvas().getContext('webgpu'), config=context.getConfiguration(), device=config.device;
+    check(config.colorSpace===outputColorSpace,'canvas uses '+outputColorSpace+' encoding');
+    context.configure({...config,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+    device.pushErrorScope('validation');
+    let peak=0;
+    for(const yaw of [0,Math.PI/2,Math.PI,-Math.PI/2]) {
+        renderer.render(0,yaw,Math.PI*0.9);
+        const canvas=renderer.getCanvas(), row=Math.ceil(canvas.width*8/256)*256;
+        const buffer=device.createBuffer({size:row*canvas.height,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+        const encoder=device.createCommandEncoder();
+        encoder.copyTextureToBuffer({texture:context.getCurrentTexture()},{buffer,bytesPerRow:row},[canvas.width,canvas.height]);
+        device.queue.submit([encoder.finish()]);await buffer.mapAsync(GPUMapMode.READ);
+        const pixels=new Uint16Array(buffer.getMappedRange());
+        for(let y=0;y<canvas.height;y++)for(let x=0;x<canvas.width*4;x++)if(x%4!==3)peak=Math.max(peak,halfToFloat(pixels[y*row/2+x]));
+        buffer.unmap();buffer.destroy();
+    }
+    check(!(await device.popErrorScope()),'WebGPU render and readback have no validation errors');
+    check(peak>1.1,'rendered canvas retains HDR values: peak '+peak.toFixed(3));
+    // A stable view must produce identical pixels across idle and active frames.
+    async function fingerprint() {
+        renderer.render(25*Math.PI/180,Math.PI,100*Math.PI/180);
+        const canvas=renderer.getCanvas(), row=Math.ceil(canvas.width*8/256)*256;
+        const buffer=device.createBuffer({size:row*canvas.height,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+        const encoder=device.createCommandEncoder();
+        encoder.copyTextureToBuffer({texture:context.getCurrentTexture()},{buffer,bytesPerRow:row},[canvas.width,canvas.height]);
+        device.queue.submit([encoder.finish()]);await buffer.mapAsync(GPUMapMode.READ);
+        const pixels=new Uint16Array(buffer.getMappedRange());
+        let hash=2166136261;
+        for(let y=0;y<canvas.height;y++)for(let x=0;x<canvas.width*4;x++)hash=Math.imul(hash^pixels[y*row/2+x],16777619);
+        buffer.unmap();buffer.destroy();return hash;
+    }
+    const baseline=await fingerprint();
+    await new Promise(resolve=>setTimeout(resolve,500));
+    check(await fingerprint()===baseline,'HDR pixels unchanged after idle');
+    for(let i=0;i<30;i++) {
+        await new Promise(requestAnimationFrame);
+        if(await fingerprint()!==baseline)throw Error('HDR pixels changed on frame '+i);
+    }
+    check(true,'HDR pixels identical across 30 consecutive frames');
+    await new Promise((resolve,reject)=>renderer.init(image,'equirectangular',Math.PI*2,Math.PI,0,resolve,{dynamicRange:'standard',sourceBlob:blob,errorCallback:reject}));
+    renderer.render(0,0,Math.PI/2);
+    const sdrInfo=renderer.getHDRInfo();
+    check(renderer.getDynamicRange()==='standard'&&sdrInfo?.decoder==='libavif-wasm'&&
+        sdrInfo?.presentation==='sdr-tonemapped'&&sdrInfo?.outputColorSpace==='srgb',
+        'PQ AVIF uses deterministic SDR tone mapping');
+    lines.push('ALL CHECKS PASSED');
+} catch(error) {lines.push('FAIL: '+(error.stack||error));}
+finally {if(renderer)renderer.destroy();results.textContent=lines.join('\n');}
+</script>

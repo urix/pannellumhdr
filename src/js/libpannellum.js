@@ -25,6 +25,10 @@ window.libpannellum = (function(window, document, undefined) {
 
 'use strict';
 
+// Resolved while the renderer script is executing, including bundled builds.
+var hdrWorkerURL = window.URL ? new URL('hdr/avif-worker.mjs',
+    (document.currentScript && document.currentScript.src) || document.baseURI).href : null;
+
 /**
  * Creates a new panorama renderer.
  * @constructor
@@ -40,6 +44,15 @@ function Renderer(container, context) {
     }
 
     var program, gl, vs, fs;
+    var gpuAdapter, gpuDevice, gpuContext, gpuPipeline, gpuBindGroup;
+    var gpuUniformBuffer, gpuSampler, gpuTextures = [], gpuTextureWidths = [];
+    var gpuUploadSources = [];
+    var gpuLinearPixels = false, gpuDecodeCancel, gpuHDRInfo = null;
+    var gpuPanoramaParams, gpuImageIsSplit = false;
+    var gpuInitGeneration = 0;
+    var gpuDiagnostics = null;
+    var useWebGPU = false, gpuOutputDynamicRange = 'standard';
+    var externalContext = context !== undefined;
     var previewProgram, previewVs, previewFs;
     var fallbackImgSize;
     var world;
@@ -53,6 +66,478 @@ function Renderer(container, context) {
 
     if (context)
         gl = context;
+
+    function replaceCanvas() {
+        if (!container)
+            return;
+        if (canvas && container.contains(canvas))
+            container.removeChild(canvas);
+        canvas = document.createElement('canvas');
+        canvas.style.width = canvas.style.height = '100%';
+        container.appendChild(canvas);
+        var pixelRatio = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * pixelRatio;
+        canvas.height = canvas.clientHeight * pixelRatio;
+    }
+
+    function destroyWebGPU() {
+        if (gpuDecodeCancel) gpuDecodeCancel();
+        gpuLinearPixels = false;
+        gpuHDRInfo = null;
+        for (var i = 0; i < gpuTextures.length; i++)
+            gpuTextures[i].destroy();
+        gpuTextures = [];
+        gpuTextureWidths = [];
+        for (var j = 0; j < gpuUploadSources.length; j++) {
+            if (gpuUploadSources[j] && gpuUploadSources[j] !== image &&
+                gpuUploadSources[j].close)
+                gpuUploadSources[j].close();
+        }
+        gpuUploadSources = [];
+        gpuImageIsSplit = false;
+        if (gpuUniformBuffer)
+            gpuUniformBuffer.destroy();
+        if (gpuContext)
+            gpuContext.unconfigure();
+        if (gpuDevice)
+            gpuDevice.destroy();
+        gpuAdapter = gpuDevice = gpuContext = gpuPipeline = gpuBindGroup = undefined;
+        gpuUniformBuffer = gpuSampler = gpuPanoramaParams = undefined;
+        useWebGPU = false;
+        gpuOutputDynamicRange = 'standard';
+    }
+
+    function isGPUExternalImageSource(source) {
+        return (source && source.hdrSource === true) || (window.HTMLImageElement && source instanceof HTMLImageElement) ||
+            (window.ImageBitmap && source instanceof ImageBitmap) ||
+            (window.HTMLCanvasElement && source instanceof HTMLCanvasElement) ||
+            (window.OffscreenCanvas && source instanceof OffscreenCanvas) ||
+            (window.HTMLVideoElement && source instanceof HTMLVideoElement) ||
+            (window.VideoFrame && source instanceof VideoFrame);
+    }
+
+    function shouldUseWebGPUHDR(source, type, params) {
+        var dynamicRange = params.dynamicRange || 'auto';
+        if (externalContext || type != 'equirectangular' ||
+            dynamicRange == 'standard' || !navigator.gpu ||
+            !isGPUExternalImageSource(source))
+            return false;
+        return dynamicRange == 'high' ||
+            (window.matchMedia && window.matchMedia('(dynamic-range: high)').matches);
+    }
+
+    function shouldUseWebGPUSDRToneMap(source, type, params) {
+        var dynamicRange = params.dynamicRange || 'auto';
+        return !externalContext && !params.webGPUFallback &&
+            type == 'equirectangular' && navigator.gpu &&
+            ((window.HTMLImageElement && source instanceof HTMLImageElement) || source.hdrSource === true) &&
+            params.sourceBlob && (dynamicRange == 'standard' ||
+                !(window.matchMedia && window.matchMedia('(dynamic-range: high)').matches));
+    }
+
+    function uploadWebGPUImage(source) {
+        // Upload explicitly color-converted pixels without asking the browser
+        // to reinterpret the original HDR image's transfer function.
+        if (gpuLinearPixels && gpuUploadSources.length === 0) return;
+        if (gpuUploadSources[0] && gpuUploadSources[0].data) {
+            gpuDiagnostics.uploads = [];
+            for (var i = 0; i < gpuUploadSources.length; i++) {
+                var pixels = gpuUploadSources[i];
+                // Chrome stages writeTexture data in a GPU buffer. Bound each
+                // upload, including its internally aligned row stride, rather
+                // than requiring a buffer as large as the entire texture.
+                var rowBytes = pixels.width * 8;
+                var stagingRowBytes = Math.ceil(rowBytes / 256) * 256;
+                var uploadLimit = Math.min(32 * 1024 * 1024,
+                    gpuDevice.limits.maxBufferSize);
+                var rowsPerUpload = Math.floor(uploadLimit / stagingRowBytes);
+                if (rowsPerUpload < 1)
+                    throw new Error('A single HDR texture row exceeds the GPU upload buffer limit.');
+                var upload = {width: pixels.width, height: pixels.height,
+                    rowsPerUpload: rowsPerUpload, chunks: 0, maxStagingBytes: 0};
+                gpuDiagnostics.uploads.push(upload);
+                for (var y = 0; y < pixels.height; y += rowsPerUpload) {
+                    var rows = Math.min(rowsPerUpload, pixels.height - y);
+                    var data = pixels.data.subarray(y * pixels.width * 4,
+                        (y + rows) * pixels.width * 4);
+                    gpuDevice.queue.writeTexture(
+                        {texture: gpuTextures[i], origin: {x: 0, y: y, z: 0}}, data,
+                        {bytesPerRow: rowBytes, rowsPerImage: rows},
+                        {width: pixels.width, height: rows}
+                    );
+                    upload.chunks++;
+                    upload.maxStagingBytes = Math.max(upload.maxStagingBytes,
+                        stagingRowBytes * rows);
+                }
+            }
+            return;
+        }
+        var firstSource = gpuUploadSources[0] || source;
+        gpuDevice.queue.copyExternalImageToTexture(
+            {source: firstSource},
+            {texture: gpuTextures[0], colorSpace: 'display-p3'},
+            {width: gpuTextureWidths[0], height: firstSource.height}
+        );
+        if (gpuImageIsSplit) {
+            var secondSource = gpuUploadSources[1] || source;
+            gpuDevice.queue.copyExternalImageToTexture(
+                gpuUploadSources[1] ? {source: secondSource} :
+                    {source: source, origin: {x: gpuTextureWidths[0], y: 0}},
+                {texture: gpuTextures[1], colorSpace: 'display-p3'},
+                {width: gpuTextureWidths[1], height: secondSource.height}
+            );
+        }
+    }
+
+    function decodeHDRAVIF(source, blob) {
+        if (!hdrWorkerURL || !window.Worker)
+            return Promise.resolve(null);
+        var generation = gpuInitGeneration;
+        var input = blob ? Promise.resolve(blob) : fetch(source.currentSrc || source.src).then(function(response) {
+            if (!response.ok) throw new Error('Unable to read the HDR image.');
+            return response.blob();
+        });
+        return input.then(function(imageBlob) {
+            if (generation != gpuInitGeneration) throw new Error('HDR load cancelled.');
+            return new Promise(function(resolve, reject) {
+                var worker = new Worker(hdrWorkerURL, {type: 'module'});
+                var finished = false;
+                function finish(error, result) {
+                    if (finished) return;
+                    finished = true;
+                    worker.terminate();
+                    gpuDecodeCancel = undefined;
+                    if (error) reject(error); else resolve(result);
+                }
+                gpuDecodeCancel = function() {finish(new Error('HDR load cancelled.'));};
+                worker.onerror = function(event) {finish(new Error(event.message || 'HDR decoder failed.'));};
+                worker.onmessage = function(event) {
+                    if (finished || generation != gpuInitGeneration) return;
+                    if (event.data.progress) {
+                        gpuDiagnostics.stage = event.data.progress;
+                        if (event.data.dimensions) gpuDiagnostics.decodedImage = event.data.dimensions;
+                        if (event.data.memory) gpuDiagnostics.decoderMemory = event.data.memory;
+                        return;
+                    }
+                    if (event.data.strip) {
+                        var strip = event.data.strip;
+                        if (generation != gpuInitGeneration || finished) return;
+                        gpuDiagnostics.stage = 'upload-hdr-strip';
+                        var upload = gpuDiagnostics.uploads[strip.texture];
+                        upload.chunks++;
+                        upload.maxStagingBytes = Math.max(upload.maxStagingBytes,
+                            Math.ceil(strip.width * 8 / 256) * 256 * strip.height);
+                        try {
+                            gpuDevice.queue.writeTexture(
+                                {texture: gpuTextures[strip.texture], origin: {x: 0, y: strip.y, z: 0}},
+                                strip.data, {bytesPerRow: strip.width * 8, rowsPerImage: strip.height},
+                                {width: strip.width, height: strip.height});
+                            gpuDevice.queue.onSubmittedWorkDone().then(function() {
+                                if (!finished && generation == gpuInitGeneration)
+                                    worker.postMessage({ack: strip.id});
+                            }).catch(function(error) {finish(error);});
+                        } catch (error) {finish(error);}
+                        return;
+                    }
+                    finish(event.data.error ? new Error(event.data.error) : null, event.data.result);
+                };
+                var widths = gpuImageIsSplit ? gpuTextureWidths : [gpuTextureWidths[0]];
+                gpuDiagnostics.uploads = widths.map(function(width) {
+                    return {width: width, height: source.height, chunks: 0, maxStagingBytes: 0};
+                });
+                worker.postMessage({blob: imageBlob, width: source.width, height: source.height,
+                    maxUploadBytes: Math.min(8 * 1024 * 1024, gpuDevice.limits.maxBufferSize),
+                    widths: widths});
+            });
+        });
+    }
+
+    function prepareWebGPUUploadSources(source, blob, requireHDRDecode) {
+        if ((window.HTMLImageElement && source instanceof HTMLImageElement) || source.hdrSource === true) {
+            return decodeHDRAVIF(source, blob).then(function(result) {
+                if (!result) {
+                    if (requireHDRDecode)
+                        throw new Error('The image is not a supported PQ HDR AVIF.');
+                    return prepareNativeWebGPUUploadSources(source);
+                }
+                gpuUploadSources = result.tiles || [];
+                gpuDiagnostics.streamedPixels = Boolean(result.streamed);
+                gpuDiagnostics.browserImageDecoded = source.hdrSource !== true;
+                gpuLinearPixels = true;
+                gpuHDRInfo = {decoder: 'libavif-wasm', depth: result.depth,
+                    transfer: 'PQ', colorSpace: 'display-p3-linear',
+                    referenceWhiteNits: 203, peakLinear: result.peak,
+                    presentation: 'webgpu',
+                    outputColorSpace: 'display-p3'};
+            });
+        }
+        return prepareNativeWebGPUUploadSources(source);
+    }
+
+    function prepareNativeWebGPUUploadSources(source) {
+        gpuUploadSources = [source];
+        if (!(window.HTMLImageElement &&
+            source instanceof HTMLImageElement))
+            return Promise.resolve();
+
+        // Direct external-image copies can retain the native HDR encoding;
+        // canvas copies can also lose extended-range values in some browsers.
+        // Use Canvas 2D's color conversion and read explicit float16 P3 pixels.
+        // Processing each texture separately also avoids partial-image copies.
+        var uploadSources = [];
+        var sourceX = 0;
+        for (var i = 0; i < (gpuImageIsSplit ? 2 : 1); i++) {
+            var stagingCanvas = document.createElement('canvas');
+            stagingCanvas.width = gpuTextureWidths[i];
+            stagingCanvas.height = source.height;
+            stagingCanvas.style.setProperty('dynamic-range-limit', 'no-limit');
+            var stagingContext = stagingCanvas.getContext('2d', {
+                colorSpace: 'display-p3',
+                colorType: 'float16'
+            });
+            if (!stagingContext)
+                throw new Error('A 16-bit floating-point canvas is unavailable.');
+            stagingContext.drawImage(source, sourceX, 0, gpuTextureWidths[i],
+                source.height, 0, 0, gpuTextureWidths[i], source.height);
+            var pixels = stagingContext.getImageData(0, 0,
+                stagingCanvas.width, stagingCanvas.height, {
+                    colorSpace: 'display-p3', pixelFormat: 'rgba-float16'
+                });
+            if (pixels.pixelFormat != 'rgba-float16' ||
+                pixels.colorSpace != 'display-p3' ||
+                pixels.data.BYTES_PER_ELEMENT != 2)
+                throw new Error('Floating-point Display-P3 image readback is unavailable.');
+            uploadSources.push(pixels);
+            stagingCanvas.width = stagingCanvas.height = 0;
+            sourceX += gpuTextureWidths[i];
+        }
+        gpuUploadSources = uploadSources;
+        return Promise.resolve();
+    }
+
+    function initWebGPUPanorama(source, haov, vaov, voffset, blob, outputDynamicRange) {
+        var generation = gpuInitGeneration;
+        gpuDiagnostics = {status: 'initializing', stage: 'request-adapter',
+            image: {width: source.width, height: source.height},
+            estimatedHDRTextureBytes: source.width * source.height * 8};
+        var sdrToneMap = outputDynamicRange == 'standard';
+        var outputFormat = sdrToneMap ? 'rgba8unorm' : 'rgba16float';
+        var outputColorSpace = sdrToneMap ? 'srgb' : 'display-p3';
+        var shader = [
+            'struct Uniforms {',
+            '    view: vec4f,',
+            '    panorama: vec4f,',
+            '    background: vec4f,',
+            '    options: vec4f,',
+            '}',
+            '@group(0) @binding(0) var<uniform> uniforms: Uniforms;',
+            '@group(0) @binding(1) var panoramaSampler: sampler;',
+            '@group(0) @binding(2) var panorama0: texture_2d<f32>;',
+            '@group(0) @binding(3) var panorama1: texture_2d<f32>;',
+            'struct VertexOutput {',
+            '    @builtin(position) position: vec4f,',
+            '    @location(0) texCoord: vec2f,',
+            '}',
+            '@vertex fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {',
+            '    var positions = array<vec2f, 6>(',
+            '        vec2f(-1.0, 1.0), vec2f(1.0, 1.0), vec2f(1.0, -1.0),',
+            '        vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(-1.0, -1.0)',
+            '    );',
+            '    var output: VertexOutput;',
+            '    output.position = vec4f(positions[vertexIndex], 0.0, 1.0);',
+            '    output.texCoord = positions[vertexIndex];',
+            '    return output;',
+            '}',
+            'fn outputColor(color: vec4f) -> vec4f {',
+            '    if (uniforms.options.z < 0.5) { return color; }',
+            '    var linear = color.rgb;',
+            '    if (uniforms.options.w > 0.5) {',
+            '        let p3 = linear;',
+            '        linear = vec3f(',
+            '            1.224745 * p3.r - 0.224904 * p3.g,',
+            '            -0.042058 * p3.r + 1.042081 * p3.g,',
+            '            -0.019642 * p3.r - 0.078655 * p3.g + 1.098537 * p3.b',
+            '        );',
+            '        let luminance = max(dot(linear, vec3f(0.2126, 0.7152, 0.0722)), 0.0);',
+            '        // Preserve natural SDR midtones while rolling HDR highlights.',
+            '        let mappedLuminance = luminance / (luminance + 1.0);',
+            '        linear *= mappedLuminance / max(luminance, 0.000001);',
+            '    }',
+            '    let v = abs(linear);',
+            '    let encoded = select(1.055 * pow(v, vec3f(1.0 / 2.4)) - 0.055,',
+            '        12.92 * v, v <= vec3f(0.0031308));',
+            '    return vec4f(sign(linear) * encoded, color.a);',
+            '}',
+            '@fragment fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {',
+            '    let PI = 3.14159265358979323846;',
+            '    let aspectRatio = uniforms.view.x;',
+            '    let psi = uniforms.view.y;',
+            '    let theta = uniforms.view.z;',
+            '    let focal = uniforms.view.w;',
+            '    let horizontalExtent = uniforms.panorama.x;',
+            '    let verticalExtent = uniforms.panorama.y;',
+            '    let verticalOffset = uniforms.panorama.z;',
+            '    let rotation = uniforms.panorama.w;',
+            '    let x = input.texCoord.x * aspectRatio;',
+            '    let y = input.texCoord.y;',
+            '    let sinrot = sin(rotation);',
+            '    let cosrot = cos(rotation);',
+            '    let rotatedX = x * cosrot - y * sinrot;',
+            '    let rotatedY = x * sinrot + y * cosrot;',
+            '    let sintheta = sin(theta);',
+            '    let costheta = cos(theta);',
+            '    let a = focal * costheta - rotatedY * sintheta;',
+            '    let root = sqrt(rotatedX * rotatedX + a * a);',
+            '    var lambda = atan2(rotatedX / root, a / root) + psi;',
+            '    let phi = atan((rotatedY * costheta + focal * sintheta) / root);',
+            '    lambda = lambda - floor((lambda + PI) / (PI * 2.0)) * PI * 2.0;',
+            '    let coord = vec2f(lambda / PI, phi / (PI / 2.0));',
+            '    if (coord.x < -horizontalExtent || coord.x > horizontalExtent ||',
+            '        coord.y < -verticalExtent + verticalOffset ||',
+            '        coord.y > verticalExtent + verticalOffset) {',
+            '        return uniforms.background;',
+            '    }',
+            '    let sourceUV = vec2f(',
+            '        (coord.x + horizontalExtent) / (horizontalExtent * 2.0),',
+            '        (-coord.y + verticalExtent + verticalOffset) / (verticalExtent * 2.0)',
+            '    );',
+            '    if (uniforms.options.x > 0.5) {',
+            '        let splitPoint = uniforms.options.y;',
+            '        if (sourceUV.x < splitPoint) {',
+            '            return outputColor(textureSampleLevel(panorama0, panoramaSampler,',
+            '                vec2f(sourceUV.x / splitPoint, sourceUV.y), 0.0));',
+            '        }',
+            '        return outputColor(textureSampleLevel(panorama1, panoramaSampler,',
+            '            vec2f((sourceUV.x - splitPoint) / (1.0 - splitPoint), sourceUV.y), 0.0));',
+            '    }',
+            '    return outputColor(textureSampleLevel(panorama0, panoramaSampler, sourceUV, 0.0));',
+            '}'
+        ].join('\n');
+
+        gpuPanoramaParams = [haov / (Math.PI * 2.0), vaov / Math.PI,
+            voffset / (Math.PI * 2.0)];
+        return navigator.gpu.requestAdapter().then(function(adapter) {
+            if (!adapter)
+                throw new Error('No WebGPU adapter is available.');
+            if (generation != gpuInitGeneration) throw new Error('HDR load cancelled.');
+            gpuAdapter = adapter;
+            gpuDiagnostics.adapterMaxTextureDimension2D = adapter.limits.maxTextureDimension2D;
+            gpuDiagnostics.adapterMaxBufferSize = adapter.limits.maxBufferSize;
+            gpuDiagnostics.stage = 'request-device';
+            return adapter.requestDevice();
+        }).then(function(device) {
+            if (generation != gpuInitGeneration) {
+                device.destroy();
+                throw new Error('HDR load cancelled.');
+            }
+            gpuDevice = device;
+            gpuDiagnostics.deviceMaxTextureDimension2D = device.limits.maxTextureDimension2D;
+            gpuDiagnostics.deviceMaxBufferSize = device.limits.maxBufferSize;
+            gpuDiagnostics.stage = 'configure-canvas';
+            gpuDevice.pushErrorScope('validation');
+            gpuContext = canvas.getContext('webgpu');
+            if (!gpuContext)
+                throw new Error('WebGPU canvas is unavailable.');
+            gpuContext.configure({
+                device: gpuDevice,
+                format: outputFormat,
+                colorSpace: outputColorSpace,
+                toneMapping: {mode: sdrToneMap ? 'standard' : 'extended'},
+                alphaMode: 'opaque'
+            });
+            var configuration = gpuContext.getConfiguration ? gpuContext.getConfiguration() : null;
+            if (!configuration || !configuration.toneMapping ||
+                configuration.toneMapping.mode != (sdrToneMap ? 'standard' : 'extended'))
+                throw new Error((sdrToneMap ? 'Standard' : 'Extended-range') +
+                    ' WebGPU canvases are unavailable.');
+
+            gpuDiagnostics.stage = 'create-textures';
+            var maxSize = gpuDevice.limits.maxTextureDimension2D;
+            if (source.height > maxSize || source.width > maxSize * 2)
+                throw {type: 'webgl size error', width: source.width, maxWidth: maxSize * 2};
+
+            var firstWidth = Math.min(source.width, maxSize);
+            var secondWidth = source.width - firstWidth;
+            gpuImageIsSplit = secondWidth > 0;
+            gpuTextureWidths = [firstWidth, secondWidth];
+            gpuDiagnostics.textureWidths = gpuTextureWidths.slice();
+            gpuTextures.push(gpuDevice.createTexture({
+                size: [firstWidth, source.height],
+                format: 'rgba16float',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+                    GPUTextureUsage.RENDER_ATTACHMENT
+            }));
+            if (gpuImageIsSplit) {
+                gpuTextures.push(gpuDevice.createTexture({
+                    size: [secondWidth, source.height],
+                    format: 'rgba16float',
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+                        GPUTextureUsage.RENDER_ATTACHMENT
+                }));
+            } else {
+                gpuTextureWidths[1] = 1;
+                gpuTextures.push(gpuDevice.createTexture({
+                    size: [1, 1],
+                    format: 'rgba16float',
+                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+                        GPUTextureUsage.RENDER_ATTACHMENT
+                }));
+            }
+
+            gpuSampler = gpuDevice.createSampler({
+                addressModeU: 'clamp-to-edge',
+                addressModeV: 'clamp-to-edge',
+                magFilter: 'linear',
+                minFilter: 'linear'
+            });
+            gpuUniformBuffer = gpuDevice.createBuffer({
+                size: 64,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+            var module = gpuDevice.createShaderModule({code: shader});
+            gpuPipeline = gpuDevice.createRenderPipeline({
+                layout: 'auto',
+                vertex: {module: module, entryPoint: 'vertexMain'},
+                fragment: {
+                    module: module,
+                    entryPoint: 'fragmentMain',
+                    targets: [{format: outputFormat}]
+                },
+                primitive: {topology: 'triangle-list'}
+            });
+            gpuBindGroup = gpuDevice.createBindGroup({
+                layout: gpuPipeline.getBindGroupLayout(0),
+                entries: [
+                    {binding: 0, resource: {buffer: gpuUniformBuffer}},
+                    {binding: 1, resource: gpuSampler},
+                    {binding: 2, resource: gpuTextures[0].createView()},
+                    {binding: 3, resource: gpuTextures[1].createView()}
+                ]
+            });
+            gpuDiagnostics.stage = 'decode-image';
+            return prepareWebGPUUploadSources(source, blob, sdrToneMap).then(function() {
+                if (generation != gpuInitGeneration) throw new Error('HDR load cancelled.');
+                gpuDiagnostics.stage = 'upload-textures';
+                uploadWebGPUImage(source);
+                if (sdrToneMap) {
+                    gpuHDRInfo.presentation = 'sdr-tonemapped';
+                    gpuHDRInfo.outputColorSpace = 'srgb';
+                    gpuHDRInfo.toneMap = 'reinhard-luminance';
+                }
+                gpuDiagnostics.stage = 'validate-gpu';
+                return gpuDevice.popErrorScope();
+            }).then(function(error) {
+                if (error)
+                    throw new Error(error.message);
+                canvas.style.setProperty('dynamic-range-limit',
+                    sdrToneMap ? 'standard' : 'no-limit');
+                gpuOutputDynamicRange = outputDynamicRange;
+                useWebGPU = true;
+                gpuDiagnostics.status = 'ready';
+                gpuDiagnostics.stage = 'ready';
+            });
+        });
+    }
 
     /**
      * Initialize renderer.
@@ -69,9 +554,12 @@ function Renderer(container, context) {
      * @param {number} vaov - Initial vertical angle of view.
      * @param {number} voffset - Initial vertical offset angle.
      * @param {function} callback - Load callback function.
-     * @param {Object} [params] - Other configuration parameters (`horizonPitch`, `horizonRoll`, `backgroundColor`).
+     * @param {Object} [params] - Other configuration parameters (`horizonPitch`, `horizonRoll`, `backgroundColor`, `dynamicRange`).
      */
     this.init = function(_image, _imageType, haov, vaov, voffset, callback, params) {
+        var initGeneration = ++gpuInitGeneration;
+        var renderer = this;
+
         // Default argument for image type
         if (_imageType === undefined)
             _imageType = 'equirectangular';
@@ -124,6 +612,82 @@ function Renderer(container, context) {
             previewProgram = undefined;
         }
         pose = undefined;
+
+        if (useWebGPU || gpuContext) {
+            destroyWebGPU();
+            replaceCanvas();
+        }
+
+        if (!globalParams.webGPUFallback) gpuDiagnostics = null;
+        var webGPUOutputDynamicRange = shouldUseWebGPUHDR(image, imageType, globalParams) ?
+            'high' : shouldUseWebGPUSDRToneMap(image, imageType, globalParams) ? 'standard' : null;
+        if (webGPUOutputDynamicRange) {
+            if (gl) {
+                var loseContext = gl.getExtension('WEBGL_lose_context');
+                if (loseContext)
+                    loseContext.loseContext();
+                gl = undefined;
+                replaceCanvas();
+            }
+            initWebGPUPanorama(image, haov, vaov, voffset, globalParams.sourceBlob,
+                webGPUOutputDynamicRange).then(function() {
+                if (initGeneration == gpuInitGeneration)
+                    callback();
+            }).catch(function(event) {
+                if (initGeneration != gpuInitGeneration)
+                    return;
+                gpuDiagnostics.status = 'fallback';
+                gpuDiagnostics.error = {name: event && (event.name || event.type) || 'Error',
+                    message: event && event.message || String(event),
+                    width: event && event.width, maxWidth: event && event.maxWidth};
+                console.warn((webGPUOutputDynamicRange == 'high' ? 'HDR rendering' :
+                    'Deterministic SDR tone mapping') +
+                    ' is unavailable; falling back to WebGL.', event);
+                destroyWebGPU();
+                replaceCanvas();
+                var fallbackParams = {};
+                for (var key in globalParams) {
+                    if (globalParams.hasOwnProperty(key))
+                        fallbackParams[key] = globalParams[key];
+                }
+                fallbackParams.dynamicRange = 'standard';
+                // A failed WebGPU attempt must fall through to WebGL instead
+                // of recursively retrying the SDR WebGPU conversion.
+                fallbackParams.webGPUFallback = true;
+                try {
+                    if (_image.hdrSource === true) {
+                        var fallbackImage = new Image();
+                        var fallbackURL = window.URL.createObjectURL(globalParams.sourceBlob);
+                        fallbackImage.onload = function() {
+                            window.URL.revokeObjectURL(fallbackURL);
+                            if (initGeneration != gpuInitGeneration) return;
+                            try {renderer.init(fallbackImage, _imageType, haov, vaov, voffset,
+                                callback, fallbackParams);} catch (error) {
+                                if (fallbackParams.errorCallback) fallbackParams.errorCallback(error);
+                            }
+                        };
+                        fallbackImage.onerror = function() {
+                            window.URL.revokeObjectURL(fallbackURL);
+                            if (initGeneration != gpuInitGeneration) return;
+                            if (fallbackParams.errorCallback)
+                                fallbackParams.errorCallback(new Error('Native panorama fallback failed.'));
+                        };
+                        fallbackImage.src = fallbackURL;
+                    } else {
+                        renderer.init(_image, _imageType, haov, vaov, voffset,
+                            callback, fallbackParams);
+                    }
+                } catch (fallbackError) {
+                    if (fallbackParams.errorCallback)
+                        fallbackParams.errorCallback(fallbackError);
+                    else
+                        throw fallbackError;
+                }
+            });
+            return;
+        }
+
+        canvas.style.setProperty('dynamic-range-limit', 'standard');
 
         var s;
         var faceMissing = false;
@@ -456,8 +1020,22 @@ function Renderer(container, context) {
             } else {
                 if (image.width <= maxWidth) {
                     gl.uniform1i(gl.getUniformLocation(program, 'u_splitImage'), 0);
-                    // Upload image to the texture
-                    gl.texImage2D(glBindType, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
+                    // Convert still images through an SDR sRGB canvas before
+                    // upload. Direct HDR image uploads can retain the source
+                    // transfer encoding in Safari's 8-bit WebGL texture.
+                    var uploadImage = image;
+                    if (window.HTMLImageElement && image instanceof HTMLImageElement) {
+                        var sdrCanvas = document.createElement('canvas');
+                        sdrCanvas.width = image.width;
+                        sdrCanvas.height = image.height;
+                        var sdrContext = sdrCanvas.getContext('2d', {
+                            colorSpace: 'srgb', colorType: 'unorm8'
+                        });
+                        sdrContext.drawImage(image, 0, 0);
+                        uploadImage = sdrContext.getImageData(0, 0,
+                            image.width, image.height);
+                    }
+                    gl.texImage2D(glBindType, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadImage);
                 } else {
                     // Image needs to be split into two parts due to texture size limits
                     gl.uniform1i(gl.getUniformLocation(program, 'u_splitImage'), 1);
@@ -466,12 +1044,14 @@ function Renderer(container, context) {
                     var cropCanvas = document.createElement('canvas');
                     cropCanvas.width = image.width / 2;
                     cropCanvas.height = image.height;
-                    var cropContext = cropCanvas.getContext('2d');
+                    var cropContext = cropCanvas.getContext('2d', {
+                        colorSpace: 'srgb', colorType: 'unorm8'
+                    });
                     cropContext.drawImage(image, 0, 0);
 
                     // Upload first half of image to the texture
                     var cropImage = cropContext.getImageData(0, 0, image.width / 2, image.height);
-                    gl.texImage2D(glBindType, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, cropImage);
+                    gl.texImage2D(glBindType, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cropImage);
 
                     // Create and bind texture for second half of image
                     program.texture2 = gl.createTexture();
@@ -480,9 +1060,10 @@ function Renderer(container, context) {
                     gl.uniform1i(gl.getUniformLocation(program, 'u_image1'), 1);
 
                     // Upload second half of image to the texture
+                    cropContext.clearRect(0, 0, cropCanvas.width, cropCanvas.height);
                     cropContext.drawImage(image, -image.width / 2, 0);
                     cropImage = cropContext.getImageData(0, 0, image.width / 2, image.height);
-                    gl.texImage2D(glBindType, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, cropImage);
+                    gl.texImage2D(glBindType, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cropImage);
 
                     // Set parameters for rendering any size
                     gl.texParameteri(glBindType, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -698,6 +1279,8 @@ function Renderer(container, context) {
      * @instance
      */
     this.destroy = function() {
+        gpuInitGeneration++;
+        destroyWebGPU();
         if (container !== undefined) {
             if (canvas !== undefined && container.contains(canvas)) {
                 container.removeChild(canvas);
@@ -724,6 +1307,8 @@ function Renderer(container, context) {
         var pixelRatio = window.devicePixelRatio || 1;
         canvas.width = canvas.clientWidth * pixelRatio;
         canvas.height = canvas.clientHeight * pixelRatio;
+        if (useWebGPU)
+            return;
         if (gl) {
             if (gl.getError() == 1286)
                 handleWebGLError1286();
@@ -817,6 +1402,9 @@ function Renderer(container, context) {
         if (params.hook) {
             params.hook({
                 gl: gl,
+                gpuDevice: gpuDevice,
+                gpuContext: gpuContext,
+                gpuPipeline: gpuPipeline,
                 program: program,
                 previewProgram: previewProgram,
                 imageType: imageType,
@@ -825,6 +1413,48 @@ function Renderer(container, context) {
                 cubeVertTexCoordBuf: cubeVertTexCoordBuf,
                 cubeVertIndBuf: cubeVertIndBuf
             });
+        }
+
+        if (useWebGPU) {
+            var gpuVfov = 2 * Math.atan(Math.tan(hfov * 0.5) /
+                (canvas.width / canvas.height));
+            focal = 1 / Math.tan(gpuVfov * 0.5);
+            var splitPoint = gpuTextureWidths[0] / image.width;
+            var color = globalParams.backgroundColor ? globalParams.backgroundColor : [0, 0, 0];
+            var uniforms = new Float32Array([
+                canvas.width / canvas.height, yaw, pitch, focal,
+                gpuPanoramaParams[0], gpuPanoramaParams[1], gpuPanoramaParams[2], roll,
+                color[0], color[1], color[2], 1,
+                gpuImageIsSplit ? 1 : 0, splitPoint, gpuLinearPixels ? 1 : 0,
+                gpuOutputDynamicRange == 'standard' ? 1 : 0
+            ]);
+            gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, uniforms);
+            if (dynamic === true)
+                uploadWebGPUImage(image);
+            var outputTexture = gpuContext.getCurrentTexture();
+            var commandEncoder = gpuDevice.createCommandEncoder();
+            var pass = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: outputTexture.createView(),
+                    clearValue: {r: color[0], g: color[1], b: color[2], a: 1},
+                    loadOp: 'clear',
+                    storeOp: 'store'
+                }]
+            });
+            pass.setPipeline(gpuPipeline);
+            pass.setBindGroup(0, gpuBindGroup);
+            pass.draw(6);
+            pass.end();
+            gpuDevice.queue.submit([commandEncoder.finish()]);
+
+            if (params.returnImage !== undefined) {
+                if (window.createImageBitmap && params.returnImage == 'ImageBitmap')
+                    return createImageBitmap(canvas);
+                if (params.returnImage.toString().indexOf('image/') == 0)
+                    return canvas.toDataURL(params.returnImage);
+                return canvas.toDataURL('image/png');
+            }
+            return;
         }
 
         // If no WebGL
@@ -1013,6 +1643,25 @@ function Renderer(container, context) {
             }
         }
         return false;
+    };
+
+    /** Return decoded HDR pixel metadata, or null for native image uploads. */
+    this.getHDRDiagnostics = function() {
+        return gpuDiagnostics ? JSON.parse(JSON.stringify(gpuDiagnostics)) : null;
+    };
+
+    this.getHDRInfo = function() {
+        return gpuHDRInfo ? JSON.parse(JSON.stringify(gpuHDRInfo)) : null;
+    };
+
+    /**
+     * Return the active output dynamic range.
+     * @memberof Renderer
+     * @instance
+     * @returns {string} `high` for the HDR WebGPU renderer, otherwise `standard`.
+     */
+    this.getDynamicRange = function() {
+        return useWebGPU ? gpuOutputDynamicRange : 'standard';
     };
 
     /**
@@ -1988,6 +2637,19 @@ var fragMulti = [
 ].join('');
 
 return {
+    prepareHDRImage: function(blob) {
+        if (!navigator.gpu || !window.Worker || !hdrWorkerURL) return Promise.resolve(null);
+        return new Promise(function(resolve) {
+            var worker = new Worker(hdrWorkerURL, {type: 'module'});
+            worker.onerror = function() {worker.terminate(); resolve(null);};
+            worker.onmessage = function(event) {
+                if (event.data.progress) return;
+                worker.terminate();
+                resolve(event.data.result || null);
+            };
+            worker.postMessage({blob: blob, probe: true});
+        });
+    },
     renderer: function(container, image, imagetype) {
         return new Renderer(container, image, imagetype);
     }

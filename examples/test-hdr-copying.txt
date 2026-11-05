@@ -1,0 +1,6 @@
+test-hdr.avif
+Copyright Yury Golubinsky.
+
+This image is licensed under the Creative Commons Attribution-ShareAlike 3.0
+Unported License, consistent with the other panorama examples in this repository.
+https://creativecommons.org/licenses/by-sa/3.0/

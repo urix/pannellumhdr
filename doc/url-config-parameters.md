@@ -20,4 +20,5 @@ These include `panorama`, `config`, `author`, `title`, `hfov`, `minHfov`, `maxHf
 `haov`, `vaov`, `vOffset`, `autoLoad`, `autoRotate`, `firstScene`,
 `ignoreGPanoXMP`, `preview`, `fallback`, `compass`, `showFullscreenCtrl`,
 `showZoomCtrl`, `keyboardZoom`, `mouseZoom`, `doubleClickZoom`,
-`disableKeyboardCtrl`, `draggable`, `showControls`, and `dragConfirm`.
+`disableKeyboardCtrl`, `draggable`, `showControls`, `dragConfirm`, and
+`dynamicRange`.

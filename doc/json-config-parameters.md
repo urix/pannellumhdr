@@ -48,6 +48,43 @@ user needs to click on the load button to load the panorama. Defaults to
 `false`.
 
 
+### `dynamicRange` (string)
+
+Controls HDR output for equirectangular panoramas. The default, `auto`, uses an
+extended-range, 16-bit floating-point WebGPU canvas when the browser reports an
+HDR-capable display. Set this to `high` to request the HDR renderer regardless
+of display detection, or to `standard` to request SDR output. Supported PQ AVIF
+images use WebGPU with luminance-based Reinhard tone mapping for SDR output;
+other images use WebGL.
+
+Rec.2020 / PQ AVIF still images use a bundled WebAssembly decoder to retain
+8-, 10-, or 12-bit source precision in Chrome and Safari. PQ values are converted
+to linear Display-P3 with 203 cd/m² reference white, filtered in linear light,
+and encoded for the extended-range canvas. This avoids browser image imports
+that tone-map HDR to SDR. The decoder runs in a temporary worker for supported
+PQ AVIF images in both HDR and SDR WebGPU output. Host the `hdr/` directory
+beside `libpannellum.js` (source) or
+`pannellum.js` (build). The build command copies this directory to `build/hdr/`;
+deploy it beside the standalone `pannellum.htm` as well.
+
+HDR output requires a secure context (HTTPS or localhost), WebGPU extended
+tone mapping, WebAssembly SIMD, and module workers. CSP must permit the local
+worker, module and WASM files. Gain-map reconstruction, HLG decoding, unknown
+ICC profiles and transformed (crop / nonzero rotation / mirror) AVIF images
+are not handled by the PQ decoder. The known Adobe Rec.2020 PQ ICC profile is
+supported; creation-date and profile-ID changes do not affect recognition.
+Other image formats use the browser's native upload path,
+whose HDR preservation depends on the browser. If any HDR requirement is missing,
+the viewer automatically falls back to SDR WebGL rendering. Cubemap and
+multiresolution panoramas currently use the SDR renderer.
+
+On a previously tested Chrome 153 / macOS 26.6.2 setup, HDR presentation could switch to
+SDR-looking output with mouse movement even when HDR pixel values are preserved.
+The independent `tests/hdr-ramp.html` reproduced this presentation issue;
+no renderer workaround was confirmed in that test. Safari HDR was visually
+verified. These observations are specific to the tested setups and do not
+establish behavior in other browser or OS versions.
+
 ### `autoRotate` (number)
 
 Setting this parameter causes the panorama to automatically rotate when loaded.

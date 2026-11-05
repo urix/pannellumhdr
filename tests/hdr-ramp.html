@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Independent WebGPU HDR ramp</title>
+<style>
+body{margin:24px;background:#222;color:#eee;font:16px system-ui}canvas{display:block;width:100%;height:300px;dynamic-range-limit:no-limit}label,button{margin:0 20px 16px 0;font:inherit}.labels{display:grid;grid-template-columns:repeat(6,1fr);text-align:center;margin:8px 0 24px}.white{background:white;color:black;padding:20px}pre{white-space:pre-wrap}
+</style>
+<h1>Independent WebGPU HDR ramp</h1>
+<p>This page draws six neutral gray patches directly with WebGPU. It uses no image decoder or panorama code. The last three patches contain values above SDR white.</p>
+<label><input id="continuous" type="checkbox"> Keep redrawing</label>
+<label>Output color space <select id="space"><option value="display-p3">Display P3</option><option value="srgb">sRGB</option></select></label>
+<button id="draw">Draw once</button>
+<canvas id="ramp" width="1200" height="300"></canvas>
+<div class="labels"><span>0 (black)</span><span>0.18</span><span>1 (SDR white)</span><span>2</span><span>4</span><span>8</span></div>
+<div class="white">CSS white reference</div>
+<p>Compare the patches while still and while redrawing. Note any abrupt change in brightness or contrast. The display may compress the brightest patches to its available HDR range.</p>
+<pre id="status">Initializing…</pre>
+<script type="module">
+const status=document.getElementById('status');
+try {
+    const adapter=await navigator.gpu?.requestAdapter();
+    if(!adapter)throw new Error('WebGPU adapter unavailable');
+    const device=await adapter.requestDevice();
+    const canvas=document.getElementById('ramp'),context=canvas.getContext('webgpu');
+    const continuous=document.getElementById('continuous'),space=document.getElementById('space');
+    device.addEventListener('uncapturederror',event=>{status.textContent=event.error.message;});
+    device.lost.then(info=>{status.textContent='Device lost: '+info.message;});
+    const module=device.createShaderModule({code:`
+        @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f {
+            let p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));
+            return vec4f(p[i],0,1);
+        }
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f {
+            let levels=array<f32,6>(0.0,0.18,1.0,2.0,4.0,8.0);
+            let linear=levels[min(u32(p.x/200.0),5u)];
+            let encoded=select(1.055*pow(linear,1.0/2.4)-0.055,12.92*linear,linear<=0.0031308);
+            return vec4f(vec3f(encoded),1.0);
+        }`});
+    const pipeline=await device.createRenderPipelineAsync({layout:'auto',vertex:{module,entryPoint:'vs'},fragment:{module,entryPoint:'fs',targets:[{format:'rgba16float'}]},primitive:{topology:'triangle-list'}});
+    let frame=0;
+    function draw(){
+        const encoder=device.createCommandEncoder();
+        const pass=encoder.beginRenderPass({colorAttachments:[{view:context.getCurrentTexture().createView(),loadOp:'clear',storeOp:'store',clearValue:{r:0,g:0,b:0,a:1}}]});
+        pass.setPipeline(pipeline);pass.draw(3);pass.end();device.queue.submit([encoder.finish()]);
+    }
+    function animate(){frame=0;if(continuous.checked&&!document.hidden){draw();frame=requestAnimationFrame(animate);}}
+    function update(){
+        cancelAnimationFrame(frame);
+        context.configure({device,format:'rgba16float',colorSpace:space.value,alphaMode:'opaque',toneMapping:{mode:'extended'}});
+        draw();
+        status.textContent=JSON.stringify({userAgent:navigator.userAgent,displayReportsHDR:matchMedia('(dynamic-range: high)').matches,colorSpace:context.getConfiguration().colorSpace,toneMapping:context.getConfiguration().toneMapping,continuous:continuous.checked,linearLevels:[0,0.18,1,2,4,8]},null,2);
+        if(continuous.checked&&!document.hidden)frame=requestAnimationFrame(animate);
+    }
+    continuous.onchange=space.onchange=update;
+    document.getElementById('draw').onclick=draw;
+    document.addEventListener('visibilitychange',()=>{cancelAnimationFrame(frame);if(!document.hidden){draw();if(continuous.checked)frame=requestAnimationFrame(animate);}});
+    window.addEventListener('pagehide',()=>{cancelAnimationFrame(frame);device.destroy();});
+    update();
+} catch(error) {status.textContent=String(error);}
+</script>
+</html>

@@ -4,6 +4,7 @@ import os
 import tempfile
 import sys
 import subprocess
+import shutil
 import urllib.parse
 
 JS = [
@@ -140,6 +141,7 @@ def build(files, css, html, filename, release=False):
     html = html.replace('<link type="text/css" rel="Stylesheet" href="standalone.css"/>', '')
     html = htmlCompress(html)
     
+    shutil.copytree('../../src/js/hdr', '../../build/hdr', dirs_exist_ok=True)
     output(addHeaderHTML(html, version), folder + htmlfilename)
     output(addHeaderCSS(css, version), folder + cssfilename)
     output(addHeaderJS(js, version), folder + filename)

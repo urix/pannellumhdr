@@ -1,12 +1,13 @@
 cff-version: 1.2.0
-title: Pannellum
+title: Pannellum HDR
 authors:
+- family-names: Golubinsky
+  given-names: Yury
 - family-names: Petroff
   given-names: Matthew
   orcid: "https://orcid.org/0000-0002-4436-4215"
-doi: 10.5281/zenodo.3334433
-repository-code: "https://github.com/mpetroff/pannellum"
-message: "If you use this software, please cite it as below."
+repository-code: "https://github.com/urix/pannellumhdr"
+message: "This HDR fork is based on Pannellum. Please cite the original Pannellum paper below."
 preferred-citation:
   type: article
   authors:

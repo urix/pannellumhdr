@@ -68,6 +68,7 @@ function parseURLParameters() {
             case 'preview':
             case 'panorama':
             case 'config':
+            case 'dynamicRange':
                 configFromURL[option] = decodeURIComponent(value);
                 break;
             default:
